@@ -1,4 +1,4 @@
-name: Probe (no LLVM, no FEX)
+name: Build Madeira IPA
 
 on:
   workflow_dispatch:
@@ -8,51 +8,50 @@ permissions:
 
 env:
   DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+  IOS_DEPLOYMENT_TARGET: "17.0"
+  MINGW: llvm-mingw-20260421-ucrt-macos-universal
 
 jobs:
-  probe:
+  build:
     runs-on: macos-15
-    timeout-minutes: 60
+    timeout-minutes: 350
 
     steps:
+
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Environment
+      - name: Select Xcode
         run: |
           set -euxo pipefail
           sudo xcode-select -s "$DEVELOPER_DIR" \
             || sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | tail -1)"
           xcodebuild -version
-          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Host dependencies
+        run: |
+          set -euxo pipefail
           brew install cmake ninja meson pkg-config bison flex sevenzip
           echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
           echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
 
-      # --------------------------------------------------------------
-      # PROBE 1 — what does the Xcode project actually want?
-      # --------------------------------------------------------------
-      - name: Xcode project shape
-        continue-on-error: true
+      - name: Metal toolchain
         run: |
-          set -x
-          xcodebuild -project app/Madeira.xcodeproj -list
-          echo "--- shared schemes (expect none) ---"
-          ls -la app/Madeira.xcodeproj/xcshareddata/xcschemes/ 2>&1 || true
-          echo "--- linked libs ---"
-          grep -oE 'path = [^;]*\.a;' app/Madeira.xcodeproj/project.pbxproj | sort -u
-          echo "--- library search paths ---"
-          grep -A8 LIBRARY_SEARCH_PATHS app/Madeira.xcodeproj/project.pbxproj | head -30
-          echo "--- already committed ---"
-          find app -name '*.a' | sort
+          xcodebuild -downloadComponent MetalToolchain \
+            || echo "downloadComponent unsupported; assuming bundled"
 
-      # --------------------------------------------------------------
-      # PROBE 2 — vcruntime (fixed: arch suffix stripped before .dll,
-      # arm64 copies excluded — a11 is arm64, a12 is amd64)
-      # --------------------------------------------------------------
+      # ==============================================================
+      # CHEAP STEPS FIRST — anything that can fail fast, fails in the
+      # first few minutes rather than after the LLVM build.
+      # ==============================================================
+
+      # Confirmed working: 12 x86-64 PE DLLs extracted. The redist is a
+      # Burn bundle (payload cab APPENDED after the UX cab, invisible to
+      # 7-Zip's PE handler), and the MSI file keys carry a .dll_amd64
+      # suffix with arm64 twins in a sibling cab — hence the carving, the
+      # arch-suffix-before-.dll normalisation, and the arm64 exclusion.
       - name: MSVC runtime DLLs
-        continue-on-error: true
         run: |
           set -euo pipefail
           DEST="$PWD/app/Madeira/x86_64-vcruntime"
@@ -104,128 +103,303 @@ jobs:
                       found[k] = p
           for k in sorted(found):
               shutil.copy(found[k], os.path.join(dest, k + '.dll'))
-              print('ok', k, '<-', found[k])
           missing = [w for w in want if w not in found]
           if missing:
               print('MISSING:', missing)
               sys.exit(1)
+          print('all 12 extracted')
           PY
-          ls -l "$DEST"
-          file "$DEST/vcruntime140.dll"
+          ls "$DEST" | wc -l
 
-      # --------------------------------------------------------------
-      # PROBE 3 — llvm-mingw (cheap: download only)
-      # --------------------------------------------------------------
+      - name: FreeType source
+        run: |
+          set -euxo pipefail
+          rm -rf research/freetype
+          git clone --depth 1 --branch VER-2-13-3 \
+            https://github.com/freetype/freetype.git research/freetype
+
       - name: llvm-mingw
-        continue-on-error: true
         run: |
           set -euxo pipefail
           mkdir -p toolchains
-          curl -fL https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz \
-            | tar -xJ -C toolchains/
-          ls toolchains/
-          toolchains/llvm-mingw-*/bin/aarch64-w64-mingw32-clang --version
+          if [ ! -d "toolchains/$MINGW" ]; then
+            curl -fL "https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/${MINGW}.tar.xz" \
+              | tar -xJ -C toolchains/
+          fi
+          "toolchains/$MINGW/bin/aarch64-w64-mingw32-clang" --version
 
-      # --------------------------------------------------------------
-      # PROBE 4 — the big unknown: does wine configure accept these flags?
-      # --------------------------------------------------------------
-      - name: Wine configure
-        continue-on-error: true
-        run: |
-          set -xo pipefail
-          export PATH="$PWD/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin:$PATH"
-          cd wine && mkdir -p build-macos && cd build-macos
-          ../configure --enable-win64 --disable-tests --without-x --without-freetype 2>&1 | tail -40
-          echo "=== config.h present? ==="
-          ls -l include/config.h || echo "NO CONFIG.H"
-          echo "=== do the dir targets exist? ==="
-          make -n include >/dev/null 2>&1 && echo "target 'include' OK" || echo "target 'include' INVALID"
-          make -n dlls/ntdll >/dev/null 2>&1 && echo "target 'dlls/ntdll' OK" || echo "target 'dlls/ntdll' INVALID"
-          make -n dlls/win32u >/dev/null 2>&1 && echo "target 'dlls/win32u' OK" || echo "target 'dlls/win32u' INVALID"
+      # ==============================================================
+      # WINE — needs a FULL make, not directory targets.
+      #
+      # `make include` / `make dlls/ntdll` appear to succeed but are
+      # no-ops: those are existing DIRECTORIES, so make reports "nothing
+      # to be done" and generates nothing. Consequences of skipping the
+      # real build: DXMT's meson fails with "winecrt0 not found"
+      # (dlls/winecrt0/libwinecrt0.a) and dwrite_unixlib fails looking
+      # for widl-generated dwrite.h.
+      #
+      # build-arm64ec is symlinked to build-macos because the only thing
+      # read from it is $build/include, where widl output lands
+      # regardless of target arch.
+      # ==============================================================
 
-      - name: Wine headers
-        continue-on-error: true
-        run: |
-          set -xo pipefail
-          cd wine/build-macos
-          make -j"$(sysctl -n hw.ncpu)" include dlls/ntdll dlls/win32u 2>&1 | tail -30 || true
-          echo "=== what the unix builds need ==="
-          ls include/config.h 2>&1
-          ls -d include dlls/ntdll dlls/win32u 2>&1
+      - name: Cache Wine build
+        id: winecache
+        uses: actions/cache@v4
+        with:
+          path: wine/build-macos
+          key: wine-7817e22-full-v1
 
-      # --------------------------------------------------------------
-      # PROBE 5 — what do the build scripts expect? (read, don't run)
-      # --------------------------------------------------------------
-      - name: Build script requirements
-        continue-on-error: true
+      - name: Build Wine (host + PE)
+        if: steps.winecache.outputs.cache-hit != 'true'
         run: |
-          set -x
-          for f in build/ntdll-unix/build.sh build/win32u-unix/build.sh \
-                   build/wineserver/build.sh build/dxmt-ios/build.sh \
-                   build/gnutls-ios/build.sh build/freetype-ios/build.sh; do
-            echo "########## $f"
-            cat "$f"
-          done
+          set -euxo pipefail
+          export PATH="$PWD/toolchains/$MINGW/bin:$PATH"
+          cd wine
+          mkdir -p build-macos && cd build-macos
+          ../configure --enable-win64 --disable-tests --without-x --without-freetype
+          test -f include/config.h
+          echo "=== cross compiler detected? ==="
+          grep -E "^(CROSSCC|CROSSTARGET|ARCHS)" Makefile | head || true
+          make -j"$(sysctl -n hw.ncpu)"
 
-      # --------------------------------------------------------------
-      # PROBE 6 — DXMT meson setup only (no compile; fast, and tells us
-      # whether the wine headers + mingw are wired correctly)
-      # --------------------------------------------------------------
-      - name: DXMT meson setup
-        continue-on-error: true
+      - name: Wire up build-arm64ec + verify Wine outputs
         run: |
-          set -xo pipefail
-          ls research/dxmt/*.txt 2>&1 || true
-          ln -sfn ../../toolchains research/dxmt/toolchains
-          export PATH="$PWD/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin:/opt/homebrew/bin:$PATH"
-          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
-          cd research/dxmt
-          meson setup --cross-file build-aarch64-win.txt --native-file build-osx.txt \
-            -Dwine_build_path=../../wine/build-macos build-pe 2>&1 | tail -40 || true
-          ls build-pe 2>&1 || echo "meson setup did not produce build-pe"
+          set -euxo pipefail
+          ln -sfn build-macos wine/build-arm64ec
+          test -f wine/build-macos/include/config.h
+          echo "=== winecrt0 (needed by DXMT meson) ==="
+          find wine/build-macos -name 'libwinecrt0.a' -o -name 'winecrt0*' | head
+          echo "=== widl headers (needed by dwrite_unixlib) ==="
+          ls wine/build-macos/include/dwrite*.h 2>&1 || echo "NO DWRITE HEADERS"
 
-      # --------------------------------------------------------------
-      # PROBE 7 — cheap native lib builds (minutes, not hours)
-      # --------------------------------------------------------------
-      - name: FreeType
-        continue-on-error: true
+      # ==============================================================
+      # NATIVE LIBS — GnuTLS must precede ntdll-unix: bcrypt, secur32
+      # and crypt32 include $REPO_ROOT/toolchains/gnutls-ios/include.
+      # Source tarballs are committed under build/gnutls-ios/src.
+      # ==============================================================
+
+      - name: Cache GnuTLS stack
+        id: gnutls
+        uses: actions/cache@v4
+        with:
+          path: toolchains/gnutls-ios
+          key: gnutls-gmp630-nettle3101-gnutls389-v1
+
+      - name: GnuTLS stack
+        if: steps.gnutls.outputs.cache-hit != 'true'
         run: |
-          set -xo pipefail
-          git clone --depth 1 --branch VER-2-13-3 \
-            https://github.com/freetype/freetype.git research/freetype
-          bash build/freetype-ios/build.sh 2>&1 | tail -20
-          find . -name libfreetype.a
+          set -euxo pipefail
+          bash build/gnutls-ios/build.sh
+          ls toolchains/gnutls-ios/lib/*.a
+
+      - name: FreeType for iOS
+        run: |
+          set -euxo pipefail
+          bash build/freetype-ios/build.sh
+          test -f build/freetype-ios/build/libfreetype.a
 
       - name: Wine unix libs
-        continue-on-error: true
         run: |
-          set -xo pipefail
-          bash build/ntdll-unix/build.sh 2>&1 | tail -30
-          bash build/win32u-unix/build.sh 2>&1 | tail -30
-          bash build/wineserver/build.sh 2>&1 | tail -30
-          ls -l app/Madeira/*.a 2>&1
+          set -euxo pipefail
+          bash build/ntdll-unix/build.sh
+          bash build/win32u-unix/build.sh
+          bash build/wineserver/build.sh
+          ls -l app/Madeira/libntdll_unix.a app/Madeira/libwin32u_unix.a \
+                app/Madeira/libwineserver.a
 
-      # --------------------------------------------------------------
-      # SUMMARY
-      # --------------------------------------------------------------
-      - name: Summary
-        if: always()
+      # ==============================================================
+      # FEX
+      # FEX_IOS_HOST: the fork gates its iOS externs (IosCbEntryLog,
+      # IosFfsBypassLog, IosJitReverseTranslate) behind this define while
+      # the code USING them is ungated — without it Core.cpp throws 14
+      # undeclared-identifier errors. FEX only appends to CMAKE_CXX_FLAGS,
+      # so passing it here is safe.
+      # ==============================================================
+
+      - name: Cache FEX build
+        id: fex
+        uses: actions/cache@v4
+        with:
+          path: FEX/build-ios
+          key: fex-053c385-iosHost-v3
+
+      - name: Configure FEX
+        if: steps.fex.outputs.cache-hit != 'true'
         run: |
-          echo "===== present in app/Madeira ====="
-          ls -l app/Madeira/*.a 2>/dev/null || echo "none"
-          ls app/Madeira/x86_64-vcruntime 2>/dev/null | wc -l
-          echo "===== wine ====="
-          ls wine/build-macos/include/config.h 2>/dev/null || echo "no config.h"
-          echo "===== dxmt ====="
-          ls research/dxmt/build-pe >/dev/null 2>&1 && echo "meson configured" || echo "meson NOT configured"
+          set -euxo pipefail
+          cmake -S FEX -B FEX/build-ios -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DCMAKE_C_FLAGS="-DFEX_IOS_HOST=1" \
+            -DCMAKE_CXX_FLAGS="-DFEX_IOS_HOST=1" \
+            -DBUILD_TESTING=OFF \
+            -DBUILD_TESTS=False \
+            -DBUILD_THUNKS=OFF \
+            -DENABLE_VIXL_DISASSEMBLER=OFF \
+            -DENABLE_VIXL_SIMULATOR=OFF \
+            -DENABLE_CCACHE=OFF \
+            -DENABLE_LTO=False \
+            -DTUNE_CPU=none \
+            -DTUNE_ARCH=generic
 
-      - name: Upload logs
+      - name: Build FEX
+        if: steps.fex.outputs.cache-hit != 'true'
+        run: |
+          set -uxo pipefail
+          cmake --build FEX/build-ios \
+            --target FEXCore FEXCore_Base JemallocLibs \
+            --parallel "$(sysctl -n hw.ncpu)" 2>&1 | tee /tmp/fex.log
+          rc=${PIPESTATUS[0]}
+          [ "$rc" -ne 0 ] && grep -n "error:" /tmp/fex.log | head -40
+          exit "$rc"
+
+      - name: Verify FEX libraries
+        run: |
+          set -euxo pipefail
+          for n in libFEXCore.a libFEXCore_Base.a libJemallocLibs.a \
+                   libfmt.a libcephes_128bit.a libxxhash.a libsoftfloat_3e.a; do
+            f="$(find FEX/build-ios -name "$n" -type f -print -quit)"
+            test -n "$f" || { echo "MISSING $n"; exit 1; }
+            lipo -info "$f"
+          done
+
+      # ==============================================================
+      # LLVM 15 for iOS — LAST of the heavy stages, because everything
+      # cheap has already been validated by this point.
+      #
+      # Libraries only: with CMAKE_SYSTEM_NAME=iOS every executable is
+      # treated as MACOSX_BUNDLE and LLVM's install() for each tool fails
+      # with "no BUNDLE DESTINATION". airconv links the libs, not tools.
+      # ==============================================================
+
+      - name: Cache LLVM iOS
+        id: llvm
+        uses: actions/cache@v4
+        with:
+          path: |
+            toolchains/llvm-project
+            toolchains/llvm-ios-build
+            toolchains/llvm-host
+          key: llvm-1507-ios-libsonly-v1
+
+      - name: LLVM 15.0.7 for iOS
+        if: steps.llvm.outputs.cache-hit != 'true'
+        run: |
+          set -euxo pipefail
+          git clone --depth 1 --branch llvmorg-15.0.7 \
+            https://github.com/llvm/llvm-project toolchains/llvm-project
+          sed -i '' 's/MATCHES "Darwin"/MATCHES "Darwin|iOS"/' \
+            toolchains/llvm-project/llvm/cmake/modules/AddLLVM.cmake
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF
+          cmake --build toolchains/llvm-host --target llvm-tblgen
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host/bin/llvm-tblgen" \
+            -DLLVM_TARGETS_TO_BUILD="" \
+            -DLLVM_BUILD_TOOLS=OFF -DLLVM_INCLUDE_TOOLS=OFF \
+            -DLLVM_BUILD_UTILS=OFF -DLLVM_INCLUDE_UTILS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF -DLLVM_INCLUDE_RUNTIMES=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF
+          cmake --build toolchains/llvm-ios-build
+          ls toolchains/llvm-ios-build/lib/*.a | head
+
+      # ==============================================================
+      # DXMT — PE modules via meson (needs Wine's winecrt0), then the
+      # unix side, then merged with the LLVM iOS archives into
+      # libdxmt_combined.a, which is what the pbxproj links.
+      # ==============================================================
+
+      - name: DXMT
+        run: |
+          set -euxo pipefail
+          ln -sfn ../../toolchains research/dxmt/toolchains
+          export PATH="$PWD/toolchains/$MINGW/bin:/opt/homebrew/bin:$PATH"
+          export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
+          cd research/dxmt
+          rm -rf build-pe
+          meson setup --cross-file build-aarch64-win.txt --native-file build-osx.txt \
+            -Dwine_build_path=../../wine/build-macos build-pe
+          meson compile -C build-pe
+          cp build-pe/src/d3d11/d3d11.dll \
+             build-pe/src/dxgi/dxgi.dll \
+             build-pe/src/winemetal/winemetal.dll \
+             build-pe/src/d3d10/d3d10core.dll \
+             ../../app/Madeira/aarch64-windows/
+          cd ../../build/dxmt-ios
+          ./build.sh
+          xcrun -sdk iphoneos libtool -static -o libdxmt_combined.a \
+            obj/*.o ../../toolchains/llvm-ios-build/lib/*.a
+          cp libdxmt_combined.a ../../app/Madeira/
+
+      - name: Verify all linked libraries
+        run: |
+          set -euxo pipefail
+          for l in libgmp libgnutls libhogweed libnettle \
+                   libntdll_unix libwin32u_unix libwineserver libdxmt_combined; do
+            test -f "app/Madeira/$l.a" || { echo "MISSING app/Madeira/$l.a"; exit 1; }
+            ls -lh "app/Madeira/$l.a"
+          done
+
+      # ==============================================================
+      # APP — xcodebuild auto-creates a scheme from the target even
+      # though the project ships no xcshareddata/xcschemes, so -target
+      # and -scheme both work. -target is used here.
+      # ==============================================================
+
+      - name: Build Madeira.app
+        run: |
+          set -euxo pipefail
+          rm -rf out
+          xcodebuild \
+            -project app/Madeira.xcodeproj \
+            -target Madeira \
+            -configuration Release \
+            -sdk iphoneos \
+            CONFIGURATION_BUILD_DIR="$PWD/out" \
+            ARCHS=arm64 ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            build
+
+      - name: Package IPA
+        run: |
+          set -euxo pipefail
+          test -d out/Madeira.app
+          lipo -info out/Madeira.app/Madeira
+          rm -rf artifacts && mkdir -p artifacts/Payload
+          cp -R out/Madeira.app artifacts/Payload/Madeira.app
+          cd artifacts && zip -qry Madeira.ipa Payload
+          unzip -l Madeira.ipa | grep -q "Payload/Madeira.app/Madeira"
+          ls -lh Madeira.ipa
+
+      - name: Upload
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: probe-logs
+          name: Madeira
           path: |
+            artifacts/Madeira.ipa
+            /tmp/fex.log
             wine/build-macos/config.log
             research/dxmt/build-pe/meson-logs/**
-            app/Madeira/x86_64-vcruntime/**
+            build/ntdll-unix/obj/*.err
+            build/win32u-unix/obj/*.err
+            build/dxmt-ios/obj/*.err
           if-no-files-found: warn
+          retention-days: 7
