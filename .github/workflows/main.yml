@@ -57,8 +57,6 @@ jobs:
 
       # ==============================================================
       # TOOLCHAINS (cached — first run is the expensive one)
-      # llvm-mingw for PE cross-compiles, LLVM 15.0.7 cross-built for
-      # iOS because DXMT's airconv links it statically.
       # ==============================================================
 
       - name: Cache toolchains
@@ -66,7 +64,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: toolchains
-          key: tc-mingw20260421-llvm1507ios-v1
+          key: tc-mingw20260421-llvm1507ios-v2
 
       - name: llvm-mingw
         if: steps.tc.outputs.cache-hit != 'true'
@@ -77,8 +75,16 @@ jobs:
             | tar -xJ -C toolchains/
           test -x toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/aarch64-w64-mingw32-clang
 
-      # Two-stage, per build/dxmt-ios/README.md. The AddLLVM.cmake edit
-      # swaps --gc-sections for -dead_strip, which Apple's ld requires.
+      # Two-stage per build/dxmt-ios/README.md: host llvm-tblgen first,
+      # then iOS target libs reusing it.
+      #
+      # The AddLLVM.cmake edit swaps --gc-sections for -dead_strip, which
+      # Apple's ld requires.
+      #
+      # CMAKE_SYSTEM_NAME=iOS makes every executable MACOSX_BUNDLE by
+      # default, and LLVM's install() rules then fail with "no BUNDLE
+      # DESTINATION" for ~60 tools. Only lib/*.a is needed here, so the
+      # tools, utils, tests, examples and benchmarks are all excluded.
       - name: LLVM 15.0.7 for iOS
         if: steps.tc.outputs.cache-hit != 'true'
         run: |
@@ -87,18 +93,40 @@ jobs:
             https://github.com/llvm/llvm-project toolchains/llvm-project
           sed -i '' 's/MATCHES "Darwin"/MATCHES "Darwin|iOS"/' \
             toolchains/llvm-project/llvm/cmake/modules/AddLLVM.cmake
+
+          # Host stage: just llvm-tblgen.
           cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host -G Ninja \
-            -DCMAKE_BUILD_TYPE=Release
+            -DCMAKE_BUILD_TYPE=Release \
+            -DLLVM_TARGETS_TO_BUILD="" \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF
           cmake --build toolchains/llvm-host --target llvm-tblgen
+
+          # iOS stage: libraries only.
           cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
             -DCMAKE_SYSTEM_NAME=iOS \
             -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
             -DLLVM_TABLEGEN="$PWD/toolchains/llvm-host/bin/llvm-tblgen" \
-            -DLLVM_BUILD_UTILS=Off \
             -DLLVM_TARGETS_TO_BUILD="" \
-            -DCMAKE_BUILD_TYPE=Release
+            -DLLVM_INCLUDE_TOOLS=OFF \
+            -DLLVM_BUILD_TOOLS=OFF \
+            -DLLVM_INCLUDE_UTILS=OFF \
+            -DLLVM_BUILD_UTILS=OFF \
+            -DLLVM_INCLUDE_TESTS=OFF \
+            -DLLVM_INCLUDE_EXAMPLES=OFF \
+            -DLLVM_INCLUDE_BENCHMARKS=OFF \
+            -DLLVM_INCLUDE_DOCS=OFF \
+            -DLLVM_ENABLE_BINDINGS=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_ZLIB=OFF
           cmake --build toolchains/llvm-ios-build
+          ls toolchains/llvm-ios-build/lib/*.a | head
 
       # ==============================================================
       # SOURCES NOT TRACKED AS SUBMODULES
@@ -111,8 +139,8 @@ jobs:
           git clone --depth 1 --branch VER-2-13-3 \
             https://github.com/freetype/freetype.git research/freetype
 
-      # Twelve Microsoft DLLs. Gitignored deliberately; folder reference
-      # in the pbxproj, so the directory must exist at build time.
+      # Twelve Microsoft DLLs. Gitignored deliberately; the pbxproj has a
+      # folder reference, so the directory must exist at build time.
       - name: MSVC runtime DLLs
         run: |
           set -euxo pipefail
@@ -124,9 +152,9 @@ jobs:
 
       # ==============================================================
       # WINE HOST TREE
-      # Only generated headers are consumed by the unix builds.
-      # config.h comes straight from configure (AC_CONFIG_HEADERS),
-      # so a full Wine build is not needed.
+      # Only generated headers are consumed by the unix builds; config.h
+      # comes straight from configure (AC_CONFIG_HEADERS), so a full
+      # Wine build is unnecessary.
       # ==============================================================
 
       - name: Wine host headers
@@ -142,13 +170,13 @@ jobs:
       # ==============================================================
       # FEX
       #
-      # The fork gates its iOS-specific externs (IosCbEntryLog,
-      # IosFfsBypassLog, IosJitReverseTranslate) behind FEX_IOS_HOST,
-      # but the code that USES them is ungated. Without the define you
-      # get 14 undeclared-identifier errors in Core.cpp.
+      # The fork gates its iOS externs (IosCbEntryLog, IosFfsBypassLog,
+      # IosJitReverseTranslate) behind FEX_IOS_HOST while the code that
+      # USES them is ungated — without the define, Core.cpp fails with 14
+      # undeclared-identifier errors.
       #
-      # Apple CMake can also leave CMAKE_SYSTEM_PROCESSOR empty, so it
-      # is forced before FEX's architecture detection runs.
+      # Apple CMake can also leave CMAKE_SYSTEM_PROCESSOR empty, so it is
+      # forced before FEX's architecture detection runs.
       # ==============================================================
 
       - name: Patch FEX CMakeLists for iOS
@@ -164,8 +192,6 @@ jobs:
               print("already patched")
               raise SystemExit(0)
 
-          # Insert immediately after the project() call so the definitions
-          # apply to every target declared afterwards.
           idx = t.find("project(")
           if idx == -1:
               raise SystemExit("ERROR: project() not found in FEX/CMakeLists.txt")
@@ -173,12 +199,12 @@ jobs:
 
           patch = '''
 
-          # MADEIRA_IOS_PATCH
-          if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
-            set(CMAKE_SYSTEM_PROCESSOR "arm64" CACHE STRING "Target processor" FORCE)
-            add_compile_definitions(FEX_IOS_HOST=1)
-          endif()
-          '''
+# MADEIRA_IOS_PATCH
+if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+  set(CMAKE_SYSTEM_PROCESSOR "arm64" CACHE STRING "Target processor" FORCE)
+  add_compile_definitions(FEX_IOS_HOST=1)
+endif()
+'''
 
           p.write_text(t[:end] + patch + t[end:])
           print("patched")
@@ -190,7 +216,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: FEX/build-ios
-          key: fex-053c385-iosHost-v1
+          key: fex-053c385-iosHost-v2
 
       - name: Configure FEX
         if: steps.fex.outputs.cache-hit != 'true'
@@ -202,6 +228,7 @@ jobs:
             -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
             -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
+            -DCMAKE_MACOSX_BUNDLE=OFF \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
             -DBUILD_TESTING=OFF \
@@ -261,7 +288,7 @@ jobs:
 
       # DXMT: PE modules via meson, then the unix side, then merged with
       # the LLVM iOS archives into libdxmt_combined.a — which is what the
-      # pbxproj actually links (NOT libdxmt_unix.a).
+      # pbxproj links (NOT libdxmt_unix.a).
       - name: DXMT
         run: |
           set -euxo pipefail
