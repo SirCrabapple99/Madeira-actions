@@ -133,16 +133,72 @@ jobs:
           git clone --depth 1 --branch VER-2-13-3 \
             https://github.com/freetype/freetype.git research/freetype
 
-      # Twelve Microsoft DLLs. Gitignored deliberately; the pbxproj has a
-      # folder reference, so the directory must exist at build time.
+      # Twelve Microsoft DLLs. Gitignored deliberately (not redistributable);
+      # the pbxproj has a folder reference, so the directory must exist.
+      # The layout inside VC_redist varies by version — recent ones are Burn
+      # bundles with no .rsrc/1033/CABINET path — so expand everything and
+      # locate the files by name.
       - name: MSVC runtime DLLs
         run: |
-          set -euxo pipefail
-          mkdir -p app/Madeira/x86_64-vcruntime
-          curl -L -o /tmp/vc.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
-          7zz x /tmp/vc.exe -o/tmp/vcr
-          7zz x '/tmp/vcr/.rsrc/1033/CABINET/*.cab' -oapp/Madeira/x86_64-vcruntime
-          ls app/Madeira/x86_64-vcruntime
+          set -euo pipefail
+          DEST="$PWD/app/Madeira/x86_64-vcruntime"
+          mkdir -p "$DEST"
+          WORK=/tmp/vcr
+          rm -rf "$WORK" && mkdir -p "$WORK"
+          cd "$WORK"
+          curl -sL -o vc.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
+          7zz x vc.exe -oL0 -y >/dev/null 2>&1 || true
+          for pass in 1 2 3 4; do
+            expanded=0
+            while IFS= read -r f; do
+              out="${f}.x"
+              [ -d "$out" ] && continue
+              if 7zz x "$f" -o"$out" -y >/dev/null 2>&1; then
+                expanded=1
+              else
+                rm -rf "$out"
+              fi
+            done < <(find . -type f ! -iname '*.dll' ! -name 'vc.exe' -size +4k)
+            [ "$expanded" -eq 0 ] && break
+          done
+          missing=0
+          for n in concrt140.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll \
+                   msvcp140_atomic_wait.dll msvcp140_codecvt_ids.dll \
+                   vcamp140.dll vccorlib140.dll vcomp140.dll \
+                   vcruntime140.dll vcruntime140_1.dll vcruntime140_threads.dll; do
+            src="$(find . -type f -iname "$n" -print -quit)"
+            if [ -z "$src" ]; then
+              echo "MISSING: $n"
+              missing=1
+            else
+              cp "$src" "$DEST/$n"
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "===== extracted tree ====="
+            find . -type f -iname '*.dll' | head -60
+            exit 1
+          fi
+          ls -l "$DEST"
+
+      # Microsoft's redistribution terms cover these files unmodified, so
+      # confirm the Authenticode payload is still intact.
+      - name: Verify vcruntime signatures
+        run: |
+          set -euo pipefail
+          python3 - app/Madeira/x86_64-vcruntime/*.dll <<'PY'
+          import struct, sys
+          bad = 0
+          for path in sys.argv[1:]:
+              d = open(path, 'rb').read()
+              pe = struct.unpack_from('<I', d, 0x3c)[0]
+              off, size = struct.unpack_from('<II', d, pe + 24 + 112 + 4*8)
+              ok = size and off + size <= len(d)
+              print(('signed  ' if ok else 'UNSIGNED'), path)
+              if not ok:
+                  bad = 1
+          sys.exit(bad)
+          PY
 
       # ==============================================================
       # WINE HOST TREE
