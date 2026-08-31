@@ -15,6 +15,15 @@ jobs:
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_16.app
 
+      - name: Fetch llvm-mingw toolchain
+        run: |
+          mkdir -p toolchains && cd toolchains
+          TC=llvm-mingw-20260421-ucrt-macos-universal
+          curl -fL -o tc.tar.xz \
+            "https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/${TC}.tar.xz"
+          tar xf tc.tar.xz
+          test -x "${TC}/bin/x86_64-w64-mingw32-clang"
+
       - name: Build native chains (Wine, FEX, DXMT)
         run: |
           for d in build/*/; do
@@ -22,7 +31,7 @@ jobs:
           done
 
       - name: Fetch vcruntime DLLs
-        run: bash tools/fetch-vcruntime.sh   # check exact filename in tools/
+        run: bash tools/fetch-vcruntime.sh   # verify exact filename in tools/
 
       - name: Build and archive iOS app
         run: |
