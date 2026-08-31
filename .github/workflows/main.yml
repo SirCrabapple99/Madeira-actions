@@ -1,4 +1,4 @@
-name: Build Madeira IPA
+name: Build Madeira
 
 on:
   workflow_dispatch:
@@ -6,48 +6,120 @@ on:
 jobs:
   build:
     runs-on: macos-15
+    timeout-minutes: 350
     steps:
-      - name: Checkout with submodules
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode_16.app
-
-      - name: Fetch llvm-mingw toolchain
+      - name: Host deps
         run: |
-          mkdir -p toolchains && cd toolchains
-          TC=llvm-mingw-20260421-ucrt-macos-universal
-          curl -fL -o tc.tar.xz \
-            "https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/${TC}.tar.xz"
-          tar xf tc.tar.xz
-          test -x "${TC}/bin/x86_64-w64-mingw32-clang"
+          brew install cmake ninja meson pkg-config bison flex sevenzip
+          echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
+          echo "$(brew --prefix flex)/bin" >> $GITHUB_PATH
 
-      - name: Build native chains (Wine, FEX, DXMT)
+      - name: Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Cache toolchains
+        id: tc
+        uses: actions/cache@v4
+        with:
+          path: toolchains
+          key: tc-llvmmingw20260421-llvm15ios-gnutls-v1
+
+      - name: llvm-mingw
+        if: steps.tc.outputs.cache-hit != 'true'
         run: |
-          for d in build/*/; do
-            [ -f "$d/build.sh" ] && bash "$d/build.sh"
-          done
+          mkdir -p toolchains
+          curl -L https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz \
+            | tar -xJ -C toolchains/
 
-      - name: Fetch vcruntime DLLs
-        run: bash tools/fetch-vcruntime.sh   # verify exact filename in tools/
-
-      - name: Build and archive iOS app
+      - name: LLVM 15.0.7 for iOS  # two-stage, see build/dxmt-ios/README.md
+        if: steps.tc.outputs.cache-hit != 'true'
         run: |
-          xcodebuild archive \
-            -project app/Madeira.xcodeproj \
-            -scheme Madeira \
-            -archivePath build/Madeira.xcarchive \
-            CODE_SIGNING_ALLOWED=NO
+          git clone --depth 1 --branch llvmorg-15.0.7 \
+            https://github.com/llvm/llvm-project toolchains/llvm-project
+          sed -i '' 's/MATCHES "Darwin"/MATCHES "Darwin|iOS"/' \
+            toolchains/llvm-project/llvm/cmake/modules/AddLLVM.cmake
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-host -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build toolchains/llvm-host --target llvm-tblgen
+          cmake -S toolchains/llvm-project/llvm -B toolchains/llvm-ios-build -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=$(xcrun --sdk iphoneos --show-sdk-path) \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DLLVM_TABLEGEN=$PWD/toolchains/llvm-host/bin/llvm-tblgen \
+            -DLLVM_BUILD_UTILS=Off -DLLVM_TARGETS_TO_BUILD="" \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build toolchains/llvm-ios-build
 
-      - name: Export unsigned IPA
+      - name: freetype source
+        run: git clone --depth 1 --branch VER-2-13-3 https://github.com/freetype/freetype.git research/freetype
+
+      - name: vcruntime DLLs
         run: |
-          mkdir -p build/Payload
-          cp -r build/Madeira.xcarchive/Products/Applications/*.app build/Payload/
-          cd build && zip -r Madeira-unsigned.ipa Payload
+          mkdir -p app/Madeira/x86_64-vcruntime
+          curl -L -o /tmp/vc.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
+          7zz x /tmp/vc.exe -o/tmp/vcr
+          7zz x '/tmp/vcr/.rsrc/1033/CABINET/*.cab' -oapp/Madeira/x86_64-vcruntime
+
+      - name: gnutls / freetype / wine host
+        run: |
+          bash build/gnutls-ios/build.sh
+          bash build/freetype-ios/build.sh
+          # wine/build-macos must exist before ntdll/win32u/wineserver:
+          cd wine && mkdir -p build-macos && cd build-macos && ../configure --enable-win64 && make -j8
+
+      - name: FEX for iOS
+        run: |
+          cmake -S FEX -B FEX/build-ios -G Ninja \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_SYSROOT=$(xcrun --sdk iphoneos --show-sdk-path) \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_BUILD_TYPE=Release
+          cmake --build FEX/build-ios
+
+      - name: Wine unix libs
+        run: |
+          bash build/ntdll-unix/build.sh
+          bash build/win32u-unix/build.sh
+          bash build/wineserver/build.sh
+
+      - name: DXMT
+        run: |
+          ln -sf ../../toolchains research/dxmt/toolchains
+          export PATH="$PWD/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin:$PATH"
+          export SDKROOT=$(xcrun --sdk macosx --show-sdk-path)
+          cd research/dxmt
+          meson setup --cross-file build-aarch64-win.txt --native-file build-osx.txt \
+            -Dwine_build_path=../../wine/build-macos build-pe
+          meson compile -C build-pe
+          cp build-pe/src/d3d11/d3d11.dll build-pe/src/dxgi/dxgi.dll \
+             build-pe/src/winemetal/winemetal.dll build-pe/src/d3d10/d3d10core.dll \
+             ../../app/Madeira/aarch64-windows/
+          cd ../../build/dxmt-ios && ./build.sh
+          xcrun -sdk iphoneos libtool -static -o libdxmt_combined.a \
+            obj/*.o ../../toolchains/llvm-ios-build/lib/*.a
+          cp libdxmt_combined.a ../../app/Madeira/
+
+      - name: Build app  # no shared scheme exists — must use -target
+        run: |
+          xcodebuild build -project app/Madeira.xcodeproj -target Madeira \
+            -configuration Release -sdk iphoneos \
+            CONFIGURATION_BUILD_DIR=$PWD/out \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload && cp -R out/Madeira.app Payload/
+          zip -qry Madeira-unsigned.ipa Payload
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: Madeira-ipa
-          path: build/Madeira-unsigned.ipa
+          name: Madeira
+          path: |
+            Madeira-unsigned.ipa
+            **/meson-logs/**
+            **/config.log
