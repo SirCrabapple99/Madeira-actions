@@ -221,14 +221,73 @@ jobs:
           bash build/freetype-ios/build.sh
           test -f build/freetype-ios/build/libfreetype.a
 
-      - name: Wine unix libs
+      - name: Wine unix libs (ntdll, win32u)
         run: |
           set -euxo pipefail
           bash build/ntdll-unix/build.sh
           bash build/win32u-unix/build.sh
+          ls -l app/Madeira/libntdll_unix.a app/Madeira/libwin32u_unix.a
+
+      # build/wineserver/build.sh does NOT build wineserver from scratch —
+      # it compiles ~20 patched files and swaps them into a PREBUILT
+      # libwineserver.a, which is gitignored and was never committed
+      # ("ERROR: No base libwineserver.a found"). So the base archive is
+      # synthesised here from every wine/server/*.c using the same flags
+      # the script uses, then the script does its replacement pass on top.
+      - name: Seed wineserver base archive
+        run: |
+          set -euxo pipefail
+          BUILD_DIR="$PWD/build/wineserver"
+          WINE_SRC="$PWD/wine"
+          SHIMS_DIR="$PWD/build/ntdll-unix/shims"
+          SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
+          OBJ="$BUILD_DIR/obj"
+          mkdir -p "$OBJ/base"
+
+          if [ ! -f "$OBJ/libwineserver.a" ]; then
+            FLAGS=(
+              -arch arm64 -isysroot "$SDK" -miphoneos-version-min=17.0 -O2
+              -I"$WINE_SRC/include" -I"$WINE_SRC/include/wine"
+              -I"$WINE_SRC/build-macos/include"
+              -I"$BUILD_DIR" -I"$WINE_SRC/server"
+              -I"$SHIMS_DIR"
+              -include "$BUILD_DIR/config_ios.h"
+              -include stdarg.h
+              -include "$BUILD_DIR/unicode_fix.h"
+              -DBINDIR=\"/usr/local/bin\" -DDATADIR=\"/usr/local/share\"
+              -D__WINESRC__ -DWINE_IOS=1
+              -Dmain=wineserver_main
+              -Wno-implicit-function-declaration
+            )
+            ok=0; bad=0; badlist=""
+            for src in "$WINE_SRC"/server/*.c; do
+              n="$(basename "$src" .c)"
+              if xcrun -sdk iphoneos clang "${FLAGS[@]}" \
+                   -c "$src" -o "$OBJ/base/$n.o" 2>"$OBJ/base/$n.err"; then
+                ok=$((ok+1))
+              else
+                bad=$((bad+1)); badlist="$badlist $n"
+              fi
+            done
+            echo "base: $ok compiled, $bad failed"
+            [ -n "$badlist" ] && echo "failed:$badlist"
+            for n in $badlist; do
+              echo "--- $n.err ---"; head -15 "$OBJ/base/$n.err"
+            done
+            ls "$OBJ"/base/*.o >/dev/null 2>&1 || { echo "FATAL: no server objects"; exit 1; }
+            ar rcs "$OBJ/libwineserver.a" "$OBJ"/base/*.o
+          fi
+          ls -l "$OBJ/libwineserver.a"
+
+      # llvm-objcopy: the script probes Homebrew paths that don't exist on
+      # the runner. llvm-mingw ships one, so put it on PATH.
+      - name: Build wineserver
+        run: |
+          set -euxo pipefail
+          export PATH="$PWD/toolchains/$MINGW/bin:$PATH"
+          command -v llvm-objcopy
           bash build/wineserver/build.sh
-          ls -l app/Madeira/libntdll_unix.a app/Madeira/libwin32u_unix.a \
-                app/Madeira/libwineserver.a
+          ls -l app/Madeira/libwineserver.a
 
       # ==============================================================
       # FEX
