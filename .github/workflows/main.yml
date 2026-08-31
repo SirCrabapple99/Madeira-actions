@@ -143,12 +143,23 @@ jobs:
           set -euo pipefail
           DEST="$PWD/app/Madeira/x86_64-vcruntime"
           mkdir -p "$DEST"
-          WORK=/tmp/vcr
-          rm -rf "$WORK" && mkdir -p "$WORK"
-          cd "$WORK"
+          WORK=/tmp/vcr; rm -rf "$WORK"; mkdir -p "$WORK"; cd "$WORK"
           curl -sL -o vc.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
-          7zz x vc.exe -oL0 -y >/dev/null 2>&1 || true
-          for pass in 1 2 3 4; do
+          # Burn bundle: the payload container is APPENDED after the UX cab,
+          # so 7-Zip's PE handler only ever sees the first, tiny one. Carve
+          # every cab out of the file by its MSCF magic instead.
+          python3 - <<'PY'
+          import re
+          d = open('vc.exe', 'rb').read()
+          offs = [m.start() for m in re.finditer(b'MSCF\x00\x00\x00\x00', d)]
+          print('cab offsets:', offs)
+          for i, o in enumerate(offs):
+              open('carve%d.cab' % i, 'wb').write(d[o:])
+          PY
+          for c in carve*.cab; do
+            7zz x "$c" -o"${c}.x" -y >/dev/null 2>&1 || true
+          done
+          for pass in 1 2 3; do
             expanded=0
             while IFS= read -r f; do
               out="${f}.x"
@@ -158,27 +169,58 @@ jobs:
               else
                 rm -rf "$out"
               fi
-            done < <(find . -type f ! -iname '*.dll' ! -name 'vc.exe' -size +4k)
+            done < <(find . -type f -size +4k ! -name 'vc.exe' ! -name 'carve*.cab')
             [ "$expanded" -eq 0 ] && break
           done
-          missing=0
-          for n in concrt140.dll msvcp140.dll msvcp140_1.dll msvcp140_2.dll \
-                   msvcp140_atomic_wait.dll msvcp140_codecvt_ids.dll \
-                   vcamp140.dll vccorlib140.dll vcomp140.dll \
-                   vcruntime140.dll vcruntime140_1.dll vcruntime140_threads.dll; do
-            src="$(find . -type f -iname "$n" -print -quit)"
-            if [ -z "$src" ]; then
-              echo "MISSING: $n"
-              missing=1
-            else
-              cp "$src" "$DEST/$n"
-            fi
-          done
-          if [ "$missing" -ne 0 ]; then
-            echo "===== extracted tree ====="
-            find . -type f -iname '*.dll' | head -60
-            exit 1
-          fi
+          # Inside the MSIs the DLLs are stored under file keys such as
+          # F_CENTRAL_vcruntime140_x64, so match on a normalised name and
+          # restore the real filename on copy.
+          python3 - "$DEST" <<'PY'
+          import os, re, shutil, sys
+          dest = sys.argv[1]
+          want = ["concrt140", "msvcp140", "msvcp140_1", "msvcp140_2",
+                  "msvcp140_atomic_wait", "msvcp140_codecvt_ids", "vcamp140",
+                  "vccorlib140", "vcomp140", "vcruntime140", "vcruntime140_1",
+                  "vcruntime140_threads"]
+          found = {}
+          for root, _, files in os.walk('.'):
+              for fn in files:
+                  p = os.path.join(root, fn)
+                  try:
+                      with open(p, 'rb') as fh:
+                          if fh.read(2) != b'MZ':
+                              continue
+                  except OSError:
+                      continue
+                  k = fn.lower()
+                  k = re.sub(r'^f_central_', '', k)
+                  k = re.sub(r'\.dll$', '', k)
+                  k = re.sub(r'_(x64|amd64)$', '', k)
+                  if k in want and k not in found:
+                      found[k] = p
+          for k in sorted(found):
+              shutil.copy(found[k], os.path.join(dest, k + '.dll'))
+              print('ok', k, '<-', found[k])
+          missing = [w for w in want if w not in found]
+          if missing:
+              print('MISSING:', missing)
+              print('----- candidate PE files -----')
+              n = 0
+              for root, _, files in os.walk('.'):
+                  for fn in files:
+                      p = os.path.join(root, fn)
+                      try:
+                          with open(p, 'rb') as fh:
+                              if fh.read(2) != b'MZ':
+                                  continue
+                      except OSError:
+                          continue
+                      print(p)
+                      n += 1
+                      if n > 200:
+                          sys.exit(1)
+              sys.exit(1)
+          PY
           ls -l "$DEST"
 
       # Microsoft's redistribution terms cover these files unmodified, so
