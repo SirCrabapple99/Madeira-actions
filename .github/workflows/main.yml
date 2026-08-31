@@ -129,18 +129,16 @@ jobs:
           "toolchains/$MINGW/bin/aarch64-w64-mingw32-clang" --version
 
       # ==============================================================
-      # WINE — needs a FULL make, not directory targets.
+      # WINE
       #
-      # `make include` / `make dlls/ntdll` appear to succeed but are
-      # no-ops: those are existing DIRECTORIES, so make reports "nothing
-      # to be done" and generates nothing. Consequences of skipping the
-      # real build: DXMT's meson fails with "winecrt0 not found"
-      # (dlls/winecrt0/libwinecrt0.a) and dwrite_unixlib fails looking
-      # for widl-generated dwrite.h.
+      # Directory targets are a trap: `make include` / `make dlls/ntdll`
+      # report "nothing to be done" because those are existing
+      # DIRECTORIES, generating nothing. Skipping the real build is why
+      # DXMT's meson failed with "winecrt0 not found" and dwrite_unixlib
+      # failed looking for widl-generated dwrite.h.
       #
-      # build-arm64ec is symlinked to build-macos because the only thing
-      # read from it is $build/include, where widl output lands
-      # regardless of target arch.
+      # build-arm64ec is symlinked to build-macos: the only thing read
+      # from it is $build/include, and widl output is arch-independent.
       # ==============================================================
 
       - name: Cache Wine build
@@ -150,7 +148,14 @@ jobs:
           path: wine/build-macos
           key: wine-7817e22-full-v1
 
-      - name: Build Wine (host + PE)
+      # NOTE: a plain `make` CANNOT succeed here. dlls/win32u/win32u.so is
+      # the macOS HOST .so, and the fork's patched bitblt.c references
+      # ios_srcwatch_arm / ios_srcwatch_arm_geom / winios_dump_srcbits —
+      # iOS-only symbols that exist only in Madeira's own iOS build. The
+      # author never builds that target. `make -k` keeps going and still
+      # produces the two things actually consumed: the PE static libs
+      # (winecrt0, for DXMT's meson) and the widl-generated headers.
+      - name: Build Wine (PE libs + generated headers)
         if: steps.winecache.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
@@ -159,19 +164,36 @@ jobs:
           mkdir -p build-macos && cd build-macos
           ../configure --enable-win64 --disable-tests --without-x --without-freetype
           test -f include/config.h
-          echo "=== cross compiler detected? ==="
-          grep -E "^(CROSSCC|CROSSTARGET|ARCHS)" Makefile | head || true
-          make -j"$(sysctl -n hw.ncpu)"
+          make -k -j"$(sysctl -n hw.ncpu)" 2>&1 | tail -40 || true
+          echo "=== host-side link failures are expected; PE side is what matters ==="
 
-      - name: Wire up build-arm64ec + verify Wine outputs
+      - name: Verify Wine outputs + wire up build-arm64ec
         run: |
-          set -euxo pipefail
+          set -euo pipefail
+          cd wine/build-macos
+          echo "=== winecrt0 (DXMT meson dependency) ==="
+          CRT0="$(find . -name 'libwinecrt0.a' -print -quit)"
+          if [ -z "$CRT0" ]; then
+            echo "libwinecrt0.a not built by the -k pass; building it explicitly"
+            export PATH="$GITHUB_WORKSPACE/toolchains/$MINGW/bin:$PATH"
+            make -j"$(sysctl -n hw.ncpu)" dlls/winecrt0/aarch64-windows/libwinecrt0.a || true
+            CRT0="$(find . -name 'libwinecrt0.a' -print -quit)"
+          fi
+          test -n "$CRT0" || { echo "FATAL: no libwinecrt0.a — DXMT cannot link"; \
+            find . -name '*.a' | head -30; exit 1; }
+          echo "found: $CRT0"
+
+          echo "=== widl headers (dwrite_unixlib dependency) ==="
+          ls include/dwrite*.h || {
+            echo "dwrite headers missing; generating explicitly"
+            export PATH="$GITHUB_WORKSPACE/toolchains/$MINGW/bin:$PATH"
+            make include/dwrite.h include/dwrite_1.h include/dwrite_2.h include/dwrite_3.h || true
+            ls include/dwrite*.h || { echo "FATAL: no dwrite headers"; exit 1; }
+          }
+
+          cd "$GITHUB_WORKSPACE"
           ln -sfn build-macos wine/build-arm64ec
-          test -f wine/build-macos/include/config.h
-          echo "=== winecrt0 (needed by DXMT meson) ==="
-          find wine/build-macos -name 'libwinecrt0.a' -o -name 'winecrt0*' | head
-          echo "=== widl headers (needed by dwrite_unixlib) ==="
-          ls wine/build-macos/include/dwrite*.h 2>&1 || echo "NO DWRITE HEADERS"
+          echo "build-arm64ec -> $(readlink wine/build-arm64ec)"
 
       # ==============================================================
       # NATIVE LIBS — GnuTLS must precede ntdll-unix: bcrypt, secur32
