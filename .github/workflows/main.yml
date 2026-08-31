@@ -303,7 +303,41 @@ jobs:
         uses: actions/cache@v4
         with:
           path: FEX/build-ios
-          key: fex-053c385-iosHost-v3
+          key: fex-053c385-iosHost-caspalstub-v4
+
+      # FEX fork bug: IosLogUnimplementedCASPAL (Arm64.cpp) sits OUTSIDE
+      # every #ifdef FEX_IOS_HOST in that file, yet calls Win32 APIs —
+      # VirtualQuery / MEMORY_BASIC_INFORMATION / LPCVOID / MEM_IMAGE —
+      # left over from the author's ARM64EC-on-Windows work. It is a pure
+      # diagnostic that only fires on a misaligned CASP (which the comment
+      # above it says a correct guest cannot emit), so it is stubbed out.
+      - name: Patch FEX Arm64.cpp Win32 probe
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path("FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp")
+          s = p.read_text()
+          sig = "static void IosLogUnimplementedCASPAL(uint32_t Size, uint64_t* GPRs, uint32_t AddressReg) {"
+          if "MADEIRA_CASPAL_STUB" in s:
+              print("already patched")
+              raise SystemExit(0)
+          i = s.find(sig)
+          if i == -1:
+              raise SystemExit("ERROR: IosLogUnimplementedCASPAL not found")
+          # end of function = first line that is exactly "}" at column 0
+          j = s.find("\n}\n", i)
+          if j == -1:
+              raise SystemExit("ERROR: could not find end of function")
+          stub = (sig + "\n"
+                  "  /* MADEIRA_CASPAL_STUB: original body used Win32 VirtualQuery,\n"
+                  "   * unavailable on iOS. Diagnostic only. */\n"
+                  "  (void)Size; (void)GPRs; (void)AddressReg;\n")
+          s = s[:i] + stub + s[j + 1:]
+          p.write_text(s)
+          print("stubbed IosLogUnimplementedCASPAL")
+          PY
+          grep -n -A4 "MADEIRA_CASPAL_STUB" FEX/FEXCore/Source/Utils/ArchHelpers/Arm64.cpp
 
       - name: Configure FEX
         if: steps.fex.outputs.cache-hit != 'true'
