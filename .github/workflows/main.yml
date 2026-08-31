@@ -1,7 +1,14 @@
-name: Build Madeira
+name: Build Madeira IPA
 
 on:
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+  IOS_DEPLOYMENT_TARGET: "17.0"
 
 jobs:
   build:
@@ -9,35 +16,51 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - uses: actions/checkout@v4
+
+      # ==============================================================
+      # CHECKOUT + ENVIRONMENT
+      # ==============================================================
+
+      - name: Checkout Madeira
+        uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      # ---------------------------------------------------------------
-      # Environment
-      # ---------------------------------------------------------------
       - name: Select Xcode
         run: |
+          set -euxo pipefail
           ls -d /Applications/Xcode*.app
-          sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | tail -1)" \
-            || sudo xcode-select -s /Applications/Xcode.app
+          sudo xcode-select -s "$DEVELOPER_DIR" \
+            || sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | tail -1)"
           xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
 
       - name: Host dependencies
         run: |
+          set -euxo pipefail
           brew install cmake ninja meson pkg-config bison flex sevenzip
-          echo "$(brew --prefix bison)/bin" >> $GITHUB_PATH
-          echo "$(brew --prefix flex)/bin" >> $GITHUB_PATH
+          echo "$(brew --prefix bison)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix flex)/bin" >> "$GITHUB_PATH"
 
       - name: Metal toolchain
         run: |
           xcodebuild -downloadComponent MetalToolchain \
             || echo "downloadComponent unsupported on this Xcode; assuming bundled"
 
-      # ---------------------------------------------------------------
-      # Cached toolchains: llvm-mingw + LLVM 15 cross-built for iOS
-      # These never change. First run is the expensive one.
-      # ---------------------------------------------------------------
+      - name: Verify source tree
+        run: |
+          set -euxo pipefail
+          test -f FEX/CMakeLists.txt
+          test -d research/dxmt/src
+          test -f wine/configure
+          test -f app/Madeira.xcodeproj/project.pbxproj
+
+      # ==============================================================
+      # TOOLCHAINS (cached — first run is the expensive one)
+      # llvm-mingw for PE cross-compiles, LLVM 15.0.7 cross-built for
+      # iOS because DXMT's airconv links it statically.
+      # ==============================================================
+
       - name: Cache toolchains
         id: tc
         uses: actions/cache@v4
@@ -48,16 +71,18 @@ jobs:
       - name: llvm-mingw
         if: steps.tc.outputs.cache-hit != 'true'
         run: |
+          set -euxo pipefail
           mkdir -p toolchains
           curl -L https://github.com/mstorsjo/llvm-mingw/releases/download/20260421/llvm-mingw-20260421-ucrt-macos-universal.tar.xz \
             | tar -xJ -C toolchains/
-          test -x toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/x86_64-w64-mingw32-clang
+          test -x toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin/aarch64-w64-mingw32-clang
 
-      # Two-stage per build/dxmt-ios/README.md: host tblgen, then iOS libs.
-      # The AddLLVM.cmake edit swaps --gc-sections for -dead_strip (Apple ld).
+      # Two-stage, per build/dxmt-ios/README.md. The AddLLVM.cmake edit
+      # swaps --gc-sections for -dead_strip, which Apple's ld requires.
       - name: LLVM 15.0.7 for iOS
         if: steps.tc.outputs.cache-hit != 'true'
         run: |
+          set -euxo pipefail
           git clone --depth 1 --branch llvmorg-15.0.7 \
             https://github.com/llvm/llvm-project toolchains/llvm-project
           sed -i '' 's/MATCHES "Darwin"/MATCHES "Darwin|iOS"/' \
@@ -75,75 +100,172 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release
           cmake --build toolchains/llvm-ios-build
 
-      # ---------------------------------------------------------------
-      # Sources not tracked as submodules
-      # ---------------------------------------------------------------
-      - name: freetype source
+      # ==============================================================
+      # SOURCES NOT TRACKED AS SUBMODULES
+      # ==============================================================
+
+      - name: FreeType source
         run: |
+          set -euxo pipefail
+          rm -rf research/freetype
           git clone --depth 1 --branch VER-2-13-3 \
             https://github.com/freetype/freetype.git research/freetype
 
-      # 12 Microsoft DLLs; gitignored on purpose, folder ref in the pbxproj.
+      # Twelve Microsoft DLLs. Gitignored deliberately; folder reference
+      # in the pbxproj, so the directory must exist at build time.
       - name: MSVC runtime DLLs
         run: |
+          set -euxo pipefail
           mkdir -p app/Madeira/x86_64-vcruntime
           curl -L -o /tmp/vc.exe https://aka.ms/vs/17/release/vc_redist.x64.exe
           7zz x /tmp/vc.exe -o/tmp/vcr
           7zz x '/tmp/vcr/.rsrc/1033/CABINET/*.cab' -oapp/Madeira/x86_64-vcruntime
           ls app/Madeira/x86_64-vcruntime
 
-      # ---------------------------------------------------------------
-      # Wine host tree — only generated headers are consumed.
-      # config.h comes straight from configure (AC_CONFIG_HEADERS).
-      # ---------------------------------------------------------------
+      # ==============================================================
+      # WINE HOST TREE
+      # Only generated headers are consumed by the unix builds.
+      # config.h comes straight from configure (AC_CONFIG_HEADERS),
+      # so a full Wine build is not needed.
+      # ==============================================================
+
       - name: Wine host headers
         run: |
+          set -euxo pipefail
           export PATH="$PWD/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin:$PATH"
           cd wine
           mkdir -p build-macos && cd build-macos
           ../configure --enable-win64 --disable-tests --without-x --without-freetype
-          test -f include/config.h || { echo "configure did not produce config.h"; exit 1; }
-          make -j8 include dlls/ntdll dlls/win32u || true
+          test -f include/config.h || { echo "configure produced no config.h"; exit 1; }
+          make -j"$(sysctl -n hw.ncpu)" include dlls/ntdll dlls/win32u || true
 
-      # ---------------------------------------------------------------
-      # Static libs Xcode links
-      # ---------------------------------------------------------------
-      - name: GnuTLS stack (GMP -> nettle -> GnuTLS)
-        run: bash build/gnutls-ios/build.sh
+      # ==============================================================
+      # FEX
+      #
+      # The fork gates its iOS-specific externs (IosCbEntryLog,
+      # IosFfsBypassLog, IosJitReverseTranslate) behind FEX_IOS_HOST,
+      # but the code that USES them is ungated. Without the define you
+      # get 14 undeclared-identifier errors in Core.cpp.
+      #
+      # Apple CMake can also leave CMAKE_SYSTEM_PROCESSOR empty, so it
+      # is forced before FEX's architecture detection runs.
+      # ==============================================================
 
-      - name: freetype for iOS
-        run: bash build/freetype-ios/build.sh
+      - name: Patch FEX CMakeLists for iOS
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path("FEX/CMakeLists.txt")
+          t = p.read_text()
+
+          if "MADEIRA_IOS_PATCH" in t:
+              print("already patched")
+              raise SystemExit(0)
+
+          # Insert immediately after the project() call so the definitions
+          # apply to every target declared afterwards.
+          idx = t.find("project(")
+          if idx == -1:
+              raise SystemExit("ERROR: project() not found in FEX/CMakeLists.txt")
+          end = t.find("\n", t.find(")", idx))
+
+          patch = '''
+
+          # MADEIRA_IOS_PATCH
+          if (CMAKE_SYSTEM_NAME STREQUAL "iOS")
+            set(CMAKE_SYSTEM_PROCESSOR "arm64" CACHE STRING "Target processor" FORCE)
+            add_compile_definitions(FEX_IOS_HOST=1)
+          endif()
+          '''
+
+          p.write_text(t[:end] + patch + t[end:])
+          print("patched")
+          PY
+          grep -n -A6 "MADEIRA_IOS_PATCH" FEX/CMakeLists.txt
 
       - name: Cache FEX build
         id: fex
         uses: actions/cache@v4
         with:
           path: FEX/build-ios
-          key: fex-${{ hashFiles('.gitmodules') }}-v1
+          key: fex-053c385-iosHost-v1
 
-      # APPLE branch in FEX's CMakeLists disables jemalloc/rpmalloc itself.
-      # JemallocLibs is still built (AllocatorHooks.cpp), so the lib exists.
-      - name: FEX for iOS
+      - name: Configure FEX
         if: steps.fex.outputs.cache-hit != 'true'
         run: |
+          set -euxo pipefail
           cmake -S FEX -B FEX/build-ios -G Ninja \
             -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_SYSTEM_PROCESSOR=arm64 \
             -DCMAKE_OSX_SYSROOT="$(xcrun --sdk iphoneos --show-sdk-path)" \
             -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$IOS_DEPLOYMENT_TARGET" \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
+            -DBUILD_TESTING=OFF \
             -DBUILD_TESTS=False \
-            -DENABLE_LTO=False
-          cmake --build FEX/build-ios --target FEXCore FEXCore_Base JemallocLibs
+            -DBUILD_THUNKS=OFF \
+            -DENABLE_VIXL_DISASSEMBLER=OFF \
+            -DENABLE_VIXL_SIMULATOR=OFF \
+            -DENABLE_CCACHE=OFF \
+            -DENABLE_LTO=False \
+            -DTUNE_CPU=none \
+            -DTUNE_ARCH=generic
+
+      - name: Build FEX
+        if: steps.fex.outputs.cache-hit != 'true'
+        run: |
+          set -uxo pipefail
+          cmake --build FEX/build-ios \
+            --target FEXCore FEXCore_Base JemallocLibs \
+            --parallel "$(sysctl -n hw.ncpu)" 2>&1 | tee /tmp/fex.log
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "===== errors ====="
+            grep -n "error:" /tmp/fex.log | head -40
+          fi
+          exit "$rc"
+
+      - name: Verify FEX libraries
+        run: |
+          set -euxo pipefail
+          find FEX/build-ios -name "*.a" -type f | sort
+          for n in libFEXCore.a libFEXCore_Base.a libJemallocLibs.a \
+                   libfmt.a libcephes_128bit.a libxxhash.a libsoftfloat_3e.a; do
+            f="$(find FEX/build-ios -name "$n" -type f -print -quit)"
+            test -n "$f" || { echo "MISSING $n"; exit 1; }
+            lipo -info "$f"
+          done
+
+      # ==============================================================
+      # NATIVE LIBS
+      # ==============================================================
+
+      - name: GnuTLS stack (GMP -> nettle -> GnuTLS)
+        run: bash build/gnutls-ios/build.sh
+
+      - name: FreeType for iOS
+        run: |
+          set -euxo pipefail
+          bash build/freetype-ios/build.sh
+          test -f build/freetype-ios/build/libfreetype.a
 
       - name: Wine unix libs
         run: |
+          set -euxo pipefail
           bash build/ntdll-unix/build.sh
           bash build/win32u-unix/build.sh
           bash build/wineserver/build.sh
 
-      - name: DXMT — PE modules + libdxmt_combined.a
+      # DXMT: PE modules via meson, then the unix side, then merged with
+      # the LLVM iOS archives into libdxmt_combined.a — which is what the
+      # pbxproj actually links (NOT libdxmt_unix.a).
+      - name: DXMT
         run: |
-          ln -sf ../../toolchains research/dxmt/toolchains
+          set -euxo pipefail
+          ln -sfn ../../toolchains research/dxmt/toolchains
           export PATH="$PWD/toolchains/llvm-mingw-20260421-ucrt-macos-universal/bin:/opt/homebrew/bin:$PATH"
           export SDKROOT="$(xcrun --sdk macosx --show-sdk-path)"
           cd research/dxmt
@@ -161,42 +283,52 @@ jobs:
             obj/*.o ../../toolchains/llvm-ios-build/lib/*.a
           cp libdxmt_combined.a ../../app/Madeira/
 
-      - name: Verify all linked libs are present
+      - name: Verify all linked libraries
         run: |
-          set -e
+          set -euxo pipefail
           for l in libgmp libgnutls libhogweed libnettle \
                    libntdll_unix libwin32u_unix libwineserver libdxmt_combined; do
             test -f "app/Madeira/$l.a" || { echo "MISSING app/Madeira/$l.a"; exit 1; }
-          done
-          for l in FEXCore/Source/libFEXCore.a \
-                   FEXCore/Source/libFEXCore_Base.a \
-                   FEXCore/Source/libJemallocLibs.a \
-                   External/fmt/libfmt.a \
-                   External/cephes/libcephes_128bit.a \
-                   External/xxhash/cmake_unofficial/libxxhash.a \
-                   External/SoftFloat-3e/libsoftfloat_3e.a; do
-            test -f "FEX/build-ios/$l" || echo "WARN missing FEX/build-ios/$l"
+            ls -lh "app/Madeira/$l.a"
           done
 
-      # ---------------------------------------------------------------
-      # App. No shared scheme exists in the pbxproj, so -target is required
-      # and `archive` (which demands a scheme) cannot be used.
-      # Action verb goes last; leading it triggers exit 64 on some versions.
-      # ---------------------------------------------------------------
-      - name: Build app
+      # ==============================================================
+      # APP
+      # No shared scheme exists in the pbxproj (no xcshareddata/), so
+      # -target is required; -scheme and -destination will both fail.
+      # The action verb goes last.
+      # ==============================================================
+
+      - name: Inspect Xcode project
+        run: xcodebuild -project app/Madeira.xcodeproj -list || true
+
+      - name: Build Madeira.app
         run: |
-          xcodebuild -project app/Madeira.xcodeproj -target Madeira \
-            -configuration Release -sdk iphoneos \
+          set -euxo pipefail
+          rm -rf out
+          xcodebuild \
+            -project app/Madeira.xcodeproj \
+            -target Madeira \
+            -configuration Release \
+            -sdk iphoneos \
             CONFIGURATION_BUILD_DIR="$PWD/out" \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
             build
 
       - name: Package IPA
         run: |
-          mkdir -p Payload
-          cp -R out/Madeira.app Payload/
-          zip -qry Madeira-unsigned.ipa Payload
-          ls -lh Madeira-unsigned.ipa
+          set -euxo pipefail
+          test -d out/Madeira.app
+          lipo -info out/Madeira.app/Madeira
+          rm -rf artifacts
+          mkdir -p artifacts/Payload
+          cp -R out/Madeira.app artifacts/Payload/Madeira.app
+          cd artifacts && zip -qry Madeira.ipa Payload
+          unzip -l Madeira.ipa | grep -q "Payload/Madeira.app/Madeira"
+          ls -lh Madeira.ipa
 
       - name: Upload
         if: always()
@@ -204,8 +336,9 @@ jobs:
         with:
           name: Madeira
           path: |
-            Madeira-unsigned.ipa
+            artifacts/Madeira.ipa
+            /tmp/fex.log
             wine/build-macos/config.log
             research/dxmt/build-pe/meson-logs/**
-            build/gnutls-ios/obj/*.log
           if-no-files-found: warn
+          retention-days: 7
