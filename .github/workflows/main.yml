@@ -441,6 +441,47 @@ jobs:
       # libdxmt_combined.a, which is what the pbxproj links.
       # ==============================================================
 
+      # airconv_context.cpp is the ONLY file including air_msad.h /
+      # air_samplepos.h / air_tessellation.h. Those are generated, not
+      # committed (.gitignore: build/dxmt-ios/shader-headers/), and only
+      # by dxmt's own meson airconv target — which Madeira does not use,
+      # since build/dxmt-ios/build.sh compiles airconv itself. So they
+      # are produced here with the same two commands meson would run:
+      #   xcrun -sdk macosx metal -o X.air -c X.metal -std=metal3.1 \
+      #         --target=air64-apple-macos14.0
+      #   xxd -n X -i X.air X.h
+      - name: Generate airconv shader headers
+        run: |
+          set -euo pipefail
+          SH="$PWD/build/dxmt-ios/shader-headers"
+          SRC="$PWD/research/dxmt/src/airconv/shaders"
+          mkdir -p "$SH"
+          ls "$SRC"
+          for m in "$SRC"/*.metal; do
+            n="$(basename "$m" .metal)"
+            xcrun -sdk macosx metal -o "$SH/$n.air" -c "$m" \
+              -std=metal3.1 --target=air64-apple-macos14.0
+            if xxd -n "$n" -i "$SH/$n.air" "$SH/$n.h" 2>/dev/null; then
+              echo "xxd: $n.h"
+            else
+              # macOS xxd may predate -n; emit the identical C form.
+              python3 - "$SH/$n.air" "$SH/$n.h" "$n" <<'PY'
+              import sys
+              air, hdr, name = sys.argv[1], sys.argv[2], sys.argv[3]
+              d = open(air, 'rb').read()
+              rows = [', '.join('0x%02x' % b for b in d[i:i+12])
+                      for i in range(0, len(d), 12)]
+              body = ',\n  '.join(rows)
+              with open(hdr, 'w') as f:
+                  f.write('unsigned char %s[] = {\n  %s\n};\n' % (name, body))
+                  f.write('unsigned int %s_len = %d;\n' % (name, len(d)))
+              print('python fallback:', hdr)
+              PY
+            fi
+          done
+          ls -l "$SH"
+          head -c 120 "$SH/air_msad.h"; echo
+
       - name: DXMT
         run: |
           set -euxo pipefail
