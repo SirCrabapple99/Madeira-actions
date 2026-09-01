@@ -137,7 +137,15 @@ jobs:
           git clone --depth 1 --branch VER-2-13-3 \
             https://github.com/freetype/freetype.git research/freetype
 
+      - name: Cache llvm-mingw
+        id: tc
+        uses: actions/cache@v4
+        with:
+          path: toolchains/llvm-mingw-20260421-ucrt-macos-universal
+          key: mingw-20260421-${{ env.CACHE_V }}
+
       - name: llvm-mingw
+        if: steps.tc.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           mkdir -p toolchains
