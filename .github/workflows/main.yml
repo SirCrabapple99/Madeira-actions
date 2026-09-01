@@ -10,6 +10,8 @@ env:
   DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
   IOS_DEPLOYMENT_TARGET: "17.0"
   MINGW: llvm-mingw-20260421-ucrt-macos-universal
+  # bump to invalidate every cache at once
+  CACHE_V: "1"
 
 jobs:
   build:
@@ -25,9 +27,18 @@ jobs:
       - name: Select Xcode
         run: |
           set -euxo pipefail
-          sudo xcode-select -s "$DEVELOPER_DIR" \
-            || sudo xcode-select -s "$(ls -d /Applications/Xcode_16*.app | tail -1)"
+          ls -d /Applications/Xcode*.app
+          # Prefer the newest Xcode: ContentView.swift uses glassEffect(),
+          # which needs the iOS 26 SDK. Falls back to the pinned one.
+          NEWEST="$(ls -d /Applications/Xcode_2*.app 2>/dev/null | sort -V | tail -1 || true)"
+          if [ -n "$NEWEST" ]; then
+            sudo xcode-select -s "$NEWEST/Contents/Developer"
+          else
+            sudo xcode-select -s "$DEVELOPER_DIR" \
+              || sudo xcode-select -s "$(ls -d /Applications/Xcode_1*.app | sort -V | tail -1)/Contents/Developer"
+          fi
           xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
 
       - name: Host dependencies
         run: |
@@ -51,7 +62,15 @@ jobs:
       # 7-Zip's PE handler), and the MSI file keys carry a .dll_amd64
       # suffix with arm64 twins in a sibling cab — hence the carving, the
       # arch-suffix-before-.dll normalisation, and the arm64 exclusion.
+      - name: Cache vcruntime
+        id: vcr
+        uses: actions/cache@v4
+        with:
+          path: app/Madeira/x86_64-vcruntime
+          key: vcruntime-17-${{ env.CACHE_V }}
+
       - name: MSVC runtime DLLs
+        if: steps.vcr.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           DEST="$PWD/app/Madeira/x86_64-vcruntime"
@@ -146,7 +165,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: wine/build-macos
-          key: wine-7817e22-full-v1
+          key: wine-7817e22-${{ env.CACHE_V }}
 
       # NOTE: a plain `make` CANNOT succeed here. dlls/win32u/win32u.so is
       # the macOS HOST .so, and the fork's patched bitblt.c references
@@ -206,7 +225,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: toolchains/gnutls-ios
-          key: gnutls-gmp630-nettle3101-gnutls389-v1
+          key: gnutls-6.3.0-3.10.1-3.8.9-${{ env.CACHE_V }}
 
       - name: GnuTLS stack
         if: steps.gnutls.outputs.cache-hit != 'true'
@@ -215,13 +234,33 @@ jobs:
           bash build/gnutls-ios/build.sh
           ls toolchains/gnutls-ios/lib/*.a
 
+      - name: Cache FreeType
+        id: ft
+        uses: actions/cache@v4
+        with:
+          path: build/freetype-ios/build
+          key: freetype-2133-${{ env.CACHE_V }}
+
       - name: FreeType for iOS
+        if: steps.ft.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           bash build/freetype-ios/build.sh
           test -f build/freetype-ios/build/libfreetype.a
 
+      - name: Cache Wine unix libs
+        id: wineunix
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/ntdll-unix/obj
+            build/win32u-unix/obj
+            app/Madeira/libntdll_unix.a
+            app/Madeira/libwin32u_unix.a
+          key: wineunix-7817e22-${{ env.CACHE_V }}
+
       - name: Wine unix libs (ntdll, win32u)
+        if: steps.wineunix.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           bash build/ntdll-unix/build.sh
@@ -234,7 +273,17 @@ jobs:
       # ("ERROR: No base libwineserver.a found"). So the base archive is
       # synthesised here from every wine/server/*.c using the same flags
       # the script uses, then the script does its replacement pass on top.
+      - name: Cache wineserver
+        id: wsrv
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/wineserver/obj
+            app/Madeira/libwineserver.a
+          key: wineserver-7817e22-${{ env.CACHE_V }}
+
       - name: Seed wineserver base archive
+        if: steps.wsrv.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           BUILD_DIR="$PWD/build/wineserver"
@@ -282,6 +331,7 @@ jobs:
       # llvm-objcopy: the script probes Homebrew paths that don't exist on
       # the runner. llvm-mingw ships one, so put it on PATH.
       - name: Build wineserver
+        if: steps.wsrv.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           export PATH="$PWD/toolchains/$MINGW/bin:$PATH"
@@ -303,7 +353,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: FEX/build-ios
-          key: fex-053c385-iosHost-caspalstub-v4
+          key: fex-053c385-caspalstub-${{ env.CACHE_V }}
 
       # FEX fork bug: IosLogUnimplementedCASPAL (Arm64.cpp) sits OUTSIDE
       # every #ifdef FEX_IOS_HOST in that file, yet calls Win32 APIs —
@@ -402,7 +452,7 @@ jobs:
             toolchains/llvm-project
             toolchains/llvm-ios-build
             toolchains/llvm-host
-          key: llvm-1507-ios-libsonly-v1
+          key: llvm-1507-ios-pruned-${{ env.CACHE_V }}
 
       - name: LLVM 15.0.7 for iOS
         if: steps.llvm.outputs.cache-hit != 'true'
@@ -434,6 +484,19 @@ jobs:
             -DLLVM_ENABLE_ZLIB=OFF
           cmake --build toolchains/llvm-ios-build
           ls toolchains/llvm-ios-build/lib/*.a | head
+          # Prune before caching: DXMT only needs llvm-ios-build/{lib,include}
+          # and llvm-project/llvm/include. The rest is many GB of objects and
+          # would blow past the repo cache budget.
+          rm -rf toolchains/llvm-host
+          find toolchains/llvm-ios-build -mindepth 1 -maxdepth 1 \
+            ! -name lib ! -name include -exec rm -rf {} +
+          find toolchains/llvm-ios-build/lib -mindepth 1 -maxdepth 1 \
+            ! -name '*.a' -exec rm -rf {} +
+          find toolchains/llvm-project -mindepth 1 -maxdepth 1 \
+            ! -name llvm -exec rm -rf {} +
+          find toolchains/llvm-project/llvm -mindepth 1 -maxdepth 1 \
+            ! -name include -exec rm -rf {} +
+          du -sh toolchains/llvm-ios-build toolchains/llvm-project
 
       # ==============================================================
       # DXMT — PE modules via meson (needs Wine's winecrt0), then the
@@ -450,7 +513,15 @@ jobs:
       #   xcrun -sdk macosx metal -o X.air -c X.metal -std=metal3.1 \
       #         --target=air64-apple-macos14.0
       #   xxd -n X -i X.air X.h
+      - name: Cache airconv shader headers
+        id: shaders
+        uses: actions/cache@v4
+        with:
+          path: build/dxmt-ios/shader-headers
+          key: shaders-b4b89f0-${{ env.CACHE_V }}
+
       - name: Generate airconv shader headers
+        if: steps.shaders.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
           cat > /tmp/hexdump.py <<'PY'
@@ -476,7 +547,19 @@ jobs:
           ls -l "$SH"
           head -2 "$SH/air_msad.h"
 
+      - name: Cache DXMT
+        id: dxmt
+        uses: actions/cache@v4
+        with:
+          path: |
+            research/dxmt/build-pe
+            build/dxmt-ios/obj
+            app/Madeira/libdxmt_combined.a
+            app/Madeira/aarch64-windows
+          key: dxmt-b4b89f0-${{ env.CACHE_V }}
+
       - name: DXMT
+        if: steps.dxmt.outputs.cache-hit != 'true'
         run: |
           set -euxo pipefail
           ln -sfn ../../toolchains research/dxmt/toolchains
@@ -512,6 +595,33 @@ jobs:
       # though the project ships no xcshareddata/xcschemes, so -target
       # and -scheme both work. -target is used here.
       # ==============================================================
+
+      # ContentView.swift calls glassEffect(.regular, in:) — iOS 26 Liquid
+      # Glass API. If the selected Xcode ships an older iOS SDK the symbol
+      # does not exist and the Swift build fails. It is purely cosmetic
+      # (a blur behind two Circles), so it is stripped when unsupported.
+      - name: Patch glassEffect for older SDKs
+        run: |
+          set -euo pipefail
+          SDKV="$(xcrun --sdk iphoneos --show-sdk-version | cut -d. -f1)"
+          echo "iphoneos SDK major: $SDKV"
+          if [ "$SDKV" -ge 26 ]; then
+            echo "SDK supports glassEffect; leaving source untouched"
+            exit 0
+          fi
+          F=app/Madeira/ContentView.swift
+          grep -n "glassEffect" "$F" || true
+          python3 - "$F" <<'PY'
+          import re, sys
+          f = sys.argv[1]
+          s = open(f).read()
+          n = s.count('.glassEffect(')
+          s2 = re.sub(r'\.glassEffect\([^()]*(?:\([^()]*\)[^()]*)*\)', '', s)
+          open(f, 'w').write(s2)
+          print('removed %d glassEffect call(s); %d remain'
+                % (n, s2.count('.glassEffect(')))
+          PY
+          grep -n "glassEffect" "$F" && { echo "FATAL: calls remain"; exit 1; } || true
 
       - name: Build Madeira.app
         run: |
